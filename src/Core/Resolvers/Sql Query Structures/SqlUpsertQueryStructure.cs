@@ -5,6 +5,7 @@ using System.Net;
 using Azure.DataApiBuilder.Auth;
 using Azure.DataApiBuilder.Config.DatabasePrimitives;
 using Azure.DataApiBuilder.Config.ObjectModel;
+using Azure.DataApiBuilder.Core.Custom;
 using Azure.DataApiBuilder.Core.Models;
 using Azure.DataApiBuilder.Core.Services;
 using Azure.DataApiBuilder.Service.Exceptions;
@@ -134,6 +135,10 @@ namespace Azure.DataApiBuilder.Core.Resolvers
                     if (param.Value is not null)
                     {
                         paramIdentifier = MakeDbConnectionParam(GetParamAsSystemType(param.Value.ToString()!, backingColumn!, GetColumnSystemType(backingColumn!)), backingColumn);
+                        // Custom spatial support: wrap geometry/geography params with STGeomFromText so both the
+                        // UPDATE and INSERT branches of the upsert write CLR spatial values.
+                        // See Azure.DataApiBuilder.Core.Custom.MsSqlSpatialExtensions.
+                        paramIdentifier = paramIdentifier.ToSpatialParameterOrDefault(sourceDefinition, backingColumn!);
                     }
                     else
                     {

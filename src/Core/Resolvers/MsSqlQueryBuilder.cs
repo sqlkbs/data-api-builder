@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using Azure.DataApiBuilder.Config.DatabasePrimitives;
 using Azure.DataApiBuilder.Config.ObjectModel;
+using Azure.DataApiBuilder.Core.Custom;
 using Azure.DataApiBuilder.Core.Models;
 using Microsoft.Data.SqlClient;
 
@@ -95,14 +96,15 @@ namespace Azure.DataApiBuilder.Core.Resolvers
                 if (!string.IsNullOrEmpty(insertColumns))
                 {
                     // When there is no DML trigger enabled on the table for insert operation, we can use OUTPUT clause to return the data.
+                    // Custom spatial support: spatial OUTPUT columns are projected as WKT via STAsText(). See Azure.DataApiBuilder.Core.Custom.MsSqlSpatialExtensions.
                     insertQuery.Append($"INSERT INTO {tableName} ({insertColumns}) OUTPUT " +
-                        $"{MakeOutputColumns(structure.OutputColumns, OutputQualifier.Inserted.ToString())} ");
+                        $"{structure.OutputColumns.FormatSpatialOutputColumns(OutputQualifier.Inserted.ToString(), sourceDefinition)} ");
                     insertQuery.Append(values);
                 }
                 else
                 {
                     insertQuery.Append($"INSERT INTO {tableName} OUTPUT " +
-                        $"{MakeOutputColumns(structure.OutputColumns, OutputQualifier.Inserted.ToString())} DEFAULT VALUES");
+                        $"{structure.OutputColumns.FormatSpatialOutputColumns(OutputQualifier.Inserted.ToString(), sourceDefinition)} DEFAULT VALUES");
                 }
             }
             else
@@ -143,7 +145,7 @@ namespace Azure.DataApiBuilder.Core.Resolvers
 
                 // Build the subsequent select query to return the inserted data. By the time the subsequent select executes,
                 // the trigger would have already executed and we get the data as it is present in the table.
-                StringBuilder subsequentSelect = new($"SELECT {MakeOutputColumns(structure.OutputColumns, tableName)} FROM {tableName} ");
+                StringBuilder subsequentSelect = new($"SELECT {structure.OutputColumns.FormatSpatialOutputColumns(tableName, sourceDefinition)} FROM {tableName} ");
 
                 if (nonAutoGenPKColumns.Count > 0)
                 {
@@ -220,8 +222,9 @@ namespace Azure.DataApiBuilder.Core.Resolvers
             string predicates = JoinPredicateStrings(
                                    structure.GetDbPolicyForOperation(EntityActionOperation.Update),
                                    Build(structure.Predicates));
+            // Custom spatial support: spatial columns returned by the mutation are projected as WKT via STAsText(). See Azure.DataApiBuilder.Core.Custom.MsSqlSpatialExtensions.
             string columnsToBeReturned =
-                MakeOutputColumns(structure.OutputColumns, isUpdateTriggerEnabled ? string.Empty : OutputQualifier.Inserted.ToString());
+                structure.OutputColumns.FormatSpatialOutputColumns(isUpdateTriggerEnabled ? string.Empty : OutputQualifier.Inserted.ToString(), sourceDefinition);
 
             StringBuilder updateQuery = new($"UPDATE {tableName} SET {Build(structure.UpdateOperations, ", ")} ");
 
@@ -283,8 +286,9 @@ namespace Azure.DataApiBuilder.Core.Resolvers
             string updatePredicates = JoinPredicateStrings(pkPredicates, structure.GetDbPolicyForOperation(EntityActionOperation.Update));
 
             string updateOperations = Build(structure.UpdateOperations, ", ");
+            // Custom spatial support: spatial columns returned by the mutation are projected as WKT via STAsText(). See Azure.DataApiBuilder.Core.Custom.MsSqlSpatialExtensions.
             string columnsToBeReturned =
-                MakeOutputColumns(structure.OutputColumns, isUpdateTriggerEnabled ? string.Empty : OutputQualifier.Inserted.ToString());
+                structure.OutputColumns.FormatSpatialOutputColumns(isUpdateTriggerEnabled ? string.Empty : OutputQualifier.Inserted.ToString(), sourceDefinition);
             string queryToGetCountOfRecordWithPK = $"SELECT COUNT(*) as {COUNT_ROWS_WITH_GIVEN_PK} FROM {tableName} WHERE {pkPredicates}";
 
             // Query to get the number of records with a given PK.
@@ -344,7 +348,7 @@ namespace Azure.DataApiBuilder.Core.Resolvers
                     {
                         // This is just an optimisation. If update trigger is enabled, then this build method had created
                         // columnsToBeReturned without the Inserted prefix.
-                        columnsToBeReturned = MakeOutputColumns(structure.OutputColumns, OutputQualifier.Inserted.ToString());
+                        columnsToBeReturned = structure.OutputColumns.FormatSpatialOutputColumns(OutputQualifier.Inserted.ToString(), sourceDefinition);
                     }
 
                     insertQuery.Append($"OUTPUT {columnsToBeReturned}");
@@ -355,7 +359,7 @@ namespace Azure.DataApiBuilder.Core.Resolvers
                 {
                     // This is again just an optimisation. If update trigger was enabled, then the columnsToBeReturned would
                     // have already been created without any prefix.
-                    columnsToBeReturned = MakeOutputColumns(structure.OutputColumns, string.Empty);
+                    columnsToBeReturned = structure.OutputColumns.FormatSpatialOutputColumns(string.Empty, sourceDefinition);
                 }
 
                 // Query to fetch the column values to be inserted into the entity.
@@ -409,32 +413,6 @@ namespace Azure.DataApiBuilder.Core.Resolvers
         private enum OutputQualifier { Inserted, Deleted };
 
         /// <summary>
-        /// Adds qualifiers (inserted or deleted) to output columns in OUTPUT clause
-        /// and joins them with commas. e.g. for outputcolumns [C1, C2, C3] and output
-        /// qualifier Inserted return
-        /// Inserted.ColumnName1 AS {Label1}, Inserted.ColumnName2 AS {Label2},
-        /// Inserted.ColumnName3 AS {Label3}
-        /// </summary>
-        private string MakeOutputColumns(List<LabelledColumn> columns, string columnPrefix)
-        {
-            return string.Join(", ", columns.Select(c => Build(c, columnPrefix)));
-        }
-
-        /// <summary>
-        /// Build a labelled column as a column and attach
-        /// ... AS {Label} to it
-        /// </summary>
-        private string Build(LabelledColumn column, string columnPrefix)
-        {
-            if (string.IsNullOrEmpty(columnPrefix))
-            {
-                return $"{QuoteIdentifier(column.ColumnName)} AS {QuoteIdentifier(column.Label)}";
-            }
-
-            return $"{columnPrefix}.{QuoteIdentifier(column.ColumnName)} AS {QuoteIdentifier(column.Label)}";
-        }
-
-        /// <summary>
         /// Add a JSON_QUERY wrapper on the column
         /// </summary>
         private string WrapSubqueryColumn(LabelledColumn column, SqlQueryStructure subquery)
@@ -473,6 +451,13 @@ namespace Azure.DataApiBuilder.Core.Resolvers
             if (IsJsonColumn(column, structure))
             {
                 return $"CAST({Build(column as Column)} AS NVARCHAR(MAX)) AS {QuoteIdentifier(column.Label)}";
+            }
+
+            // Custom spatial support: geometry/geography columns are projected as Well-Known Text (WKT)
+            // via STAsText() so the CLR spatial value round-trips as a string. See Azure.DataApiBuilder.Core.Custom.MsSqlSpatialExtensions.
+            if (structure.GetUnderlyingSourceDefinition().TryGetSpatialTypeName(column.ColumnName, out string? spatialTypeName))
+            {
+                return spatialTypeName.ToSpatialProjection(Build(column as Column), column.Label);
             }
 
             return Build(column);
