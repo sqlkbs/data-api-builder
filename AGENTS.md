@@ -125,8 +125,8 @@ When generating code or refactoring features, be aware of the following custom s
 - **Query Building:** Converts projections to `STAsText() AS [Column]` (WKT) or `.ToGeoJson()`.
 - **Mutations:** Wraps incoming text parameters with `geometry::STGeomFromText(@param, 4326)` during `INSERT`/`UPDATE`.
 
-### B. Dynamic Tenant Schema Registry (`sys_TenantCustomFields`)
-- **Metadata Management:** Dynamic tenant JSON columns are registered in `dbo.sys_TenantCustomFields`.
+### B. Dynamic Tenant Schema Registry (`sys_TenantSchemaFields`)
+- **Metadata Management:** Dynamic tenant JSON columns are registered in `dbo.sys_TenantSchemaFields`.
 - **In-Memory Caching:** Registry metadata is loaded into a thread-safe `ConcurrentDictionary` on startup via `ITenantSchemaRegistryService`. **Never issue a database roundtrip per API request to fetch schema mapping.**
 - **Query Interception:** `MsSqlQueryBuilder` inspects `HttpContext` claims for `TenantId`, retrieves registered custom JSON fields from memory, and automatically appends `JSON_VALUE(...) AS [Alias]` or `LEFT JOIN` lookup definitions to the SQL AST.
 

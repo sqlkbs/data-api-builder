@@ -35,4 +35,4 @@ git merge feature/mssql-geometry --no-ff -m "Merge MSSQL Geometry support"
 git merge feature/mssql-schema-hot-reload --no-ff -m "Merge MSSQL Schema Hot Reload"
 
 # 3. Push to your private repo to trigger your Azure DevOps / GitHub Actions build
-git push origin release/custom-build --force
+git push origin release/custom-build --force-with-lease

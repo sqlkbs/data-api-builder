@@ -18,11 +18,11 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Build Project
-        run: dotnet build --configuration Release
+      - name: Publish Project
+        run: dotnet publish src/Azure.DataApiBuilder.sln --configuration Release --output ./published-app
 
       - name: Save Build Artifact
         uses: actions/upload-artifact@v4
         with:
           name: dab-compiled-release
-          path: ./bin/Release/net8.0/
+          path: ./published-app
