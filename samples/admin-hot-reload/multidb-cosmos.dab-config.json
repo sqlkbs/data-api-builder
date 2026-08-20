@@ -1,0 +1,20 @@
+{
+  "$schema": "https://github.com/Azure/data-api-builder/releases/download/vmajor.minor.patch/dab.draft.schema.json",
+  "data-source": {
+    "database-type": "cosmosdb_nosql",
+    "connection-string": "AccountEndpoint=@env('DAB_COSMOS_ENDPOINT');AccountKey=@env('DAB_COSMOS_KEY');",
+    "options": {
+      "database": "graphqldb",
+      "container": "planet",
+      "schema": "schema.gql"
+    }
+  },
+  "entities": {
+    "Planet": {
+      "source": { "object": "graphqldb.planet", "type": "table" },
+      "permissions": [
+        { "role": "anonymous", "actions": [ "read" ] }
+      ]
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://github.com/Azure/data-api-builder/releases/download/vmajor.minor.patch/dab.draft.schema.json",
+  "data-source": {
+    "database-type": "mssql",
+    "connection-string": "Server=localhost;Database=library;User ID=sa;Password=@env('DAB_DB_PASSWORD');TrustServerCertificate=True;"
+  },
+  "runtime": {
+    "rest": { "enabled": true, "path": "/api" },
+    "graphql": { "enabled": true, "path": "/graphql" },
+    "host": {
+      "mode": "development",
+      "authentication": { "provider": "AppService" }
+    }
+  },
+  "entities": {
+    "Book": {
+      "source": { "object": "dbo.Books", "type": "table" },
+      "permissions": [
+        { "role": "anonymous", "actions": [ "read" ] }
+      ]
+    }
+  }
+}

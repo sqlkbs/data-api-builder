@@ -6,6 +6,7 @@ using Azure.DataApiBuilder.Auth;
 using Azure.DataApiBuilder.Config;
 using Azure.DataApiBuilder.Config.ObjectModel;
 using Azure.DataApiBuilder.Core.Configurations;
+using Azure.DataApiBuilder.Core.Custom.HotReload;
 using Azure.DataApiBuilder.Core.Models;
 using Azure.DataApiBuilder.Core.Services.Cache;
 using Azure.DataApiBuilder.Core.Services.MetadataProviders;
@@ -67,30 +68,91 @@ namespace Azure.DataApiBuilder.Core.Resolvers.Factories
 
             if (config.SqlDataSourceUsed)
             {
-                IQueryEngine queryEngine = new SqlQueryEngine(
-                    _queryManagerFactory,
-                    _metadataProviderFactory,
-                    _contextAccessor,
-                    _authorizationResolver,
-                    _gQLFilterParser,
-                    _logger,
-                    _runtimeConfigProvider,
-                    _cache);
-                _queryEngines.Add(DatabaseType.MSSQL, queryEngine);
-                _queryEngines.Add(DatabaseType.MySQL, queryEngine);
-                _queryEngines.Add(DatabaseType.PostgreSQL, queryEngine);
-                _queryEngines.Add(DatabaseType.DWSQL, queryEngine);
+                IQueryEngine queryEngine = CreateSqlQueryEngine();
+                foreach (DatabaseType sqlDatabaseType in SqlDatabaseTypes)
+                {
+                    _queryEngines.Add(sqlDatabaseType, queryEngine);
+                }
             }
 
             if (config.CosmosDataSourceUsed)
             {
-                IQueryEngine queryEngine = new CosmosQueryEngine(_cosmosClientProvider, _metadataProviderFactory, _authorizationResolver, _gQLFilterParser, _runtimeConfigProvider, _cache);
-                _queryEngines.Add(DatabaseType.CosmosDB_NoSQL, queryEngine);
+                _queryEngines.Add(DatabaseType.CosmosDB_NoSQL, CreateCosmosQueryEngine());
+            }
+        }
+
+        /// <summary>The SQL database types that share the single SQL query engine instance.</summary>
+        private static readonly DatabaseType[] SqlDatabaseTypes =
+        {
+            DatabaseType.MSSQL,
+            DatabaseType.MySQL,
+            DatabaseType.PostgreSQL,
+            DatabaseType.DWSQL
+        };
+
+        private IQueryEngine CreateSqlQueryEngine()
+        {
+            return new SqlQueryEngine(
+                _queryManagerFactory,
+                _metadataProviderFactory,
+                _contextAccessor,
+                _authorizationResolver,
+                _gQLFilterParser,
+                _logger,
+                _runtimeConfigProvider,
+                _cache);
+        }
+
+        private IQueryEngine CreateCosmosQueryEngine()
+        {
+            return new CosmosQueryEngine(_cosmosClientProvider, _metadataProviderFactory, _authorizationResolver, _gQLFilterParser, _runtimeConfigProvider, _cache);
+        }
+
+        /// <summary>
+        /// Custom fork: rebuilds the query engine entries for a single database type from the
+        /// current runtime configuration. SQL database types share one engine instance, so all
+        /// SQL keys are replaced together. Used by the scoped hot reload engine; see
+        /// <c>Azure.DataApiBuilder.Core.Custom.HotReload</c>.
+        /// </summary>
+        internal void RebuildQueryEngine(DatabaseType databaseType)
+        {
+            RuntimeConfig config = _runtimeConfigProvider.GetConfig();
+
+            if (databaseType == DatabaseType.CosmosDB_NoSQL)
+            {
+                _queryEngines.Remove(DatabaseType.CosmosDB_NoSQL);
+                if (config.CosmosDataSourceUsed)
+                {
+                    _queryEngines.Add(DatabaseType.CosmosDB_NoSQL, CreateCosmosQueryEngine());
+                }
+
+                return;
+            }
+
+            foreach (DatabaseType sqlDatabaseType in SqlDatabaseTypes)
+            {
+                _queryEngines.Remove(sqlDatabaseType);
+            }
+
+            if (config.SqlDataSourceUsed)
+            {
+                IQueryEngine queryEngine = CreateSqlQueryEngine();
+                foreach (DatabaseType sqlDatabaseType in SqlDatabaseTypes)
+                {
+                    _queryEngines.Add(sqlDatabaseType, queryEngine);
+                }
             }
         }
 
         public void OnConfigChanged(object? sender, HotReloadEventArgs args)
         {
+            // Custom fork: single-database hot reload. When the engine installed a scoped
+            // change set, rebuild only the changed database types and skip the full rebuild.
+            if (this.TryApplyScopedQueryEngineRebuild(args))
+            {
+                return;
+            }
+
             _queryEngines = new Dictionary<DatabaseType, IQueryEngine>();
             ConfigureQueryEngines();
         }

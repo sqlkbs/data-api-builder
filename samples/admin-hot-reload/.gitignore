@@ -1,0 +1,6 @@
+# These sample configurations intentionally use the conventional Data API builder config
+# file names (so they can be copied into place directly). They contain placeholder
+# connection strings only — never real secrets. Re-include them despite the repository-wide
+# ignore rules for dab-config*.json / *.dab-config.json.
+!dab-config.json
+!*.dab-config.json
