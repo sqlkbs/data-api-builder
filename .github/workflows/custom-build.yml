@@ -1,0 +1,28 @@
+name: Custom Build Release
+
+on:
+  push:
+    branches:
+      - 'release/custom-build'   # Exact match
+      # - 'release/**'            # Wildcard match (matches release/anything)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+     - name: Build Project
+        run: dotnet build --configuration Release
+        
+     - name: Save Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dab-compiled-release
+          path: ./published-app # or ./bin/Release/net8.0/
