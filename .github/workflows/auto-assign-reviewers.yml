@@ -1,19 +1,19 @@
 name: PR Review Assignment Bot
 
-on:
-  pull_request_target:
-    types: [opened, reopened, labeled]
+# on:
+#   pull_request_target:
+#     types: [opened, reopened, labeled]
 
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Run in dry-run mode (no actual assignments)'
-        required: false
-        default: 'true'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
+#   workflow_dispatch:
+#     inputs:
+#       dry_run:
+#         description: 'Run in dry-run mode (no actual assignments)'
+#         required: false
+#         default: 'true'
+#         type: choice
+#         options:
+#           - 'true'
+#           - 'false'
 
   # schedule:
   #   - cron: "*/10 * * * *"
