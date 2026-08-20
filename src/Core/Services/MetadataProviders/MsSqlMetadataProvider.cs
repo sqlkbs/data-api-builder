@@ -9,6 +9,7 @@ using System.Text.Json.Nodes;
 using Azure.DataApiBuilder.Config.DatabasePrimitives;
 using Azure.DataApiBuilder.Config.ObjectModel;
 using Azure.DataApiBuilder.Core.Configurations;
+using Azure.DataApiBuilder.Core.Custom;
 using Azure.DataApiBuilder.Core.Models;
 using Azure.DataApiBuilder.Core.Resolvers;
 using Azure.DataApiBuilder.Core.Resolvers.Factories;
@@ -56,7 +57,9 @@ namespace Azure.DataApiBuilder.Core.Services
         /// </summary>
         public override Type SqlToCLRType(string sqlType)
         {
-            return TypeHelper.GetSystemTypeFromSqlDbType(sqlType);
+            // Custom spatial support: geometry/geography map to typeof(string).
+            // See Azure.DataApiBuilder.Core.Custom.MsSqlSpatialExtensions.
+            return sqlType.ToSpatialSystemTypeOrDefault();
         }
 
         /// <inheritdoc/>
@@ -129,6 +132,10 @@ namespace Azure.DataApiBuilder.Core.Services
                         columnDefinition.ElementSystemType = typeof(Single);
                         columnDefinition.SystemType = columnDefinition.ElementSystemType.MakeArrayType();
                     }
+
+                    // Custom spatial support: retain the raw SQL type name and remap geometry/geography
+                    // to typeof(string). See Azure.DataApiBuilder.Core.Custom.MsSqlSpatialExtensions.
+                    columnDefinition.ApplySpatialTypeMapping(sqlDbTypeName);
 
                     if (Enum.TryParse(sqlDbTypeName, ignoreCase: true, out SqlDbType sqlDbType))
                     {

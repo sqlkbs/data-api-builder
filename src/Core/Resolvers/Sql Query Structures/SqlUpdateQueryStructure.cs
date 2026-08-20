@@ -5,6 +5,7 @@ using System.Net;
 using Azure.DataApiBuilder.Auth;
 using Azure.DataApiBuilder.Config.DatabasePrimitives;
 using Azure.DataApiBuilder.Config.ObjectModel;
+using Azure.DataApiBuilder.Core.Custom;
 using Azure.DataApiBuilder.Core.Models;
 using Azure.DataApiBuilder.Core.Services;
 using Azure.DataApiBuilder.Service.Exceptions;
@@ -184,11 +185,15 @@ namespace Azure.DataApiBuilder.Core.Resolvers
             else
             {
                 string stringValue = GetStringifiedValue(param.Value);
+                string paramIdentifier = MakeDbConnectionParam(GetParamAsSystemType(stringValue, backingColumn, GetColumnSystemType(backingColumn)), backingColumn);
+                // Custom spatial support: wrap geometry/geography update params with STGeomFromText.
+                // See Azure.DataApiBuilder.Core.Custom.MsSqlSpatialExtensions.
+                paramIdentifier = paramIdentifier.ToSpatialParameterOrDefault(sourceDefinition, backingColumn);
                 predicate = new(
                     new PredicateOperand(
                         new Column(tableSchema: DatabaseObject.SchemaName, tableName: DatabaseObject.Name, backingColumn)),
                     PredicateOperation.Equal,
-                    new PredicateOperand($"{MakeDbConnectionParam(GetParamAsSystemType(stringValue, backingColumn, GetColumnSystemType(backingColumn)), backingColumn)}"));
+                    new PredicateOperand($"{paramIdentifier}"));
             }
 
             return predicate;
