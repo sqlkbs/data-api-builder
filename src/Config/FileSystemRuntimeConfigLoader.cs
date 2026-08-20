@@ -338,6 +338,14 @@ public class FileSystemRuntimeConfigLoader : RuntimeConfigLoader, IDisposable
     }
 
     /// <summary>
+    /// Custom fork: public signal wrapper used by the admin hot reload endpoint
+    /// (<c>POST /admin/hot-reload</c>) to programmatically raise DAB's standard
+    /// config-changed signal (change token + hot reload event cascade) without a file change on
+    /// disk. See <c>Azure.DataApiBuilder.Core.Custom.HotReload.HotReloadEngine</c>.
+    /// </summary>
+    public void SignalConfigReloaded(string message = "") => SignalConfigChanged(message);
+
+    /// <summary>
     /// Hot Reloads the runtime config when the file watcher
     /// is active and detects a change to the underlying config file.
     /// </summary>

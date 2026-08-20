@@ -7,6 +7,7 @@ using Azure.DataApiBuilder.Config;
 using Azure.DataApiBuilder.Config.DatabasePrimitives;
 using Azure.DataApiBuilder.Config.ObjectModel;
 using Azure.DataApiBuilder.Core.Configurations;
+using Azure.DataApiBuilder.Core.Custom.HotReload;
 using Azure.DataApiBuilder.Core.Resolvers.Factories;
 using Azure.DataApiBuilder.Service.Exceptions;
 using Microsoft.Extensions.Logging;
@@ -49,22 +50,59 @@ namespace Azure.DataApiBuilder.Core.Services.MetadataProviders
         {
             foreach ((string dataSourceName, DataSource dataSource) in _runtimeConfigProvider.GetConfig().GetDataSourceNamesToDataSourcesIterator())
             {
-                ISqlMetadataProvider metadataProvider = dataSource.DatabaseType switch
-                {
-                    DatabaseType.CosmosDB_NoSQL => new CosmosSqlMetadataProvider(_runtimeConfigProvider, _runtimeConfigValidator, _fileSystem),
-                    DatabaseType.MSSQL => new MsSqlMetadataProvider(_runtimeConfigProvider, _runtimeConfigValidator, _queryManagerFactory, _logger, dataSourceName, _isValidateOnly),
-                    DatabaseType.DWSQL => new MsSqlMetadataProvider(_runtimeConfigProvider, _runtimeConfigValidator, _queryManagerFactory, _logger, dataSourceName, _isValidateOnly),
-                    DatabaseType.PostgreSQL => new PostgreSqlMetadataProvider(_runtimeConfigProvider, _runtimeConfigValidator, _queryManagerFactory, _logger, dataSourceName, _isValidateOnly),
-                    DatabaseType.MySQL => new MySqlMetadataProvider(_runtimeConfigProvider, _runtimeConfigValidator, _queryManagerFactory, _logger, dataSourceName, _isValidateOnly),
-                    _ => throw new NotSupportedException(dataSource.DatabaseTypeNotSupportedMessage),
-                };
-
-                _metadataProviders.Add(dataSourceName, metadataProvider);
+                _metadataProviders.Add(dataSourceName, CreateMetadataProvider(dataSourceName, dataSource));
             }
+        }
+
+        private ISqlMetadataProvider CreateMetadataProvider(string dataSourceName, DataSource dataSource)
+        {
+            return dataSource.DatabaseType switch
+            {
+                DatabaseType.CosmosDB_NoSQL => new CosmosSqlMetadataProvider(_runtimeConfigProvider, _runtimeConfigValidator, _fileSystem),
+                DatabaseType.MSSQL => new MsSqlMetadataProvider(_runtimeConfigProvider, _runtimeConfigValidator, _queryManagerFactory, _logger, dataSourceName, _isValidateOnly),
+                DatabaseType.DWSQL => new MsSqlMetadataProvider(_runtimeConfigProvider, _runtimeConfigValidator, _queryManagerFactory, _logger, dataSourceName, _isValidateOnly),
+                DatabaseType.PostgreSQL => new PostgreSqlMetadataProvider(_runtimeConfigProvider, _runtimeConfigValidator, _queryManagerFactory, _logger, dataSourceName, _isValidateOnly),
+                DatabaseType.MySQL => new MySqlMetadataProvider(_runtimeConfigProvider, _runtimeConfigValidator, _queryManagerFactory, _logger, dataSourceName, _isValidateOnly),
+                _ => throw new NotSupportedException(dataSource.DatabaseTypeNotSupportedMessage),
+            };
+        }
+
+        /// <summary>
+        /// Custom fork: rebuilds the in-memory metadata (schema caches) of a single data source
+        /// from the current runtime configuration. The new provider is fully initialized
+        /// <b>before</b> it replaces the existing one, so an unchanged/failed data source keeps
+        /// serving from its previous metadata. Used by the scoped hot reload engine; see
+        /// <c>Azure.DataApiBuilder.Core.Custom.HotReload</c>.
+        /// </summary>
+        internal async Task RebuildDataSourceMetadataProvider(string dataSourceName)
+        {
+            RuntimeConfig config = _runtimeConfigProvider.GetConfig();
+
+            if (!config.CheckDataSourceExists(dataSourceName))
+            {
+                // The data source was removed from the configuration; drop its provider.
+                _metadataProviders.Remove(dataSourceName);
+                return;
+            }
+
+            DataSource dataSource = config.GetDataSourceFromDataSourceName(dataSourceName);
+            ISqlMetadataProvider metadataProvider = CreateMetadataProvider(dataSourceName, dataSource);
+
+            // Database roundtrip happens here — only for the data source being refreshed.
+            await metadataProvider.InitializeAsync();
+
+            _metadataProviders[dataSourceName] = metadataProvider;
         }
 
         public void OnConfigChanged(object? sender, HotReloadEventArgs args)
         {
+            // Custom fork: single-database hot reload. When the engine installed a scoped
+            // change set, rebuild only the changed data sources and skip the full rebuild.
+            if (this.TryApplyScopedMetadataRebuild(args))
+            {
+                return;
+            }
+
             _metadataProviders.Clear();
             ConfigureMetadataProviders();
             // Blocks the current thread until initialization is finished.

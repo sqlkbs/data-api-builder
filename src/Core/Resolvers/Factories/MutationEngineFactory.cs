@@ -6,6 +6,7 @@ using Azure.DataApiBuilder.Auth;
 using Azure.DataApiBuilder.Config;
 using Azure.DataApiBuilder.Config.ObjectModel;
 using Azure.DataApiBuilder.Core.Configurations;
+using Azure.DataApiBuilder.Core.Custom.HotReload;
 using Azure.DataApiBuilder.Core.Models;
 using Azure.DataApiBuilder.Core.Services.MetadataProviders;
 using Azure.DataApiBuilder.Service.Exceptions;
@@ -71,29 +72,90 @@ namespace Azure.DataApiBuilder.Core.Resolvers.Factories
 
             if (config.SqlDataSourceUsed)
             {
-                IMutationEngine mutationEngine = new SqlMutationEngine(
-                    _queryManagerFactory,
-                    _metadataProviderFactory,
-                    _queryEngineFactory,
-                    _authorizationResolver,
-                    _gQLFilterParser,
-                    _httpContextAccessor,
-                    _runtimeConfigProvider);
-                _mutationEngines.Add(DatabaseType.MySQL, mutationEngine);
-                _mutationEngines.Add(DatabaseType.MSSQL, mutationEngine);
-                _mutationEngines.Add(DatabaseType.PostgreSQL, mutationEngine);
-                _mutationEngines.Add(DatabaseType.DWSQL, mutationEngine);
+                IMutationEngine mutationEngine = CreateSqlMutationEngine();
+                foreach (DatabaseType sqlDatabaseType in SqlDatabaseTypes)
+                {
+                    _mutationEngines.Add(sqlDatabaseType, mutationEngine);
+                }
             }
 
             if (config.CosmosDataSourceUsed)
             {
-                IMutationEngine mutationEngine = new CosmosMutationEngine(_cosmosClientProvider, _metadataProviderFactory, _authorizationResolver);
-                _mutationEngines.Add(DatabaseType.CosmosDB_NoSQL, mutationEngine);
+                _mutationEngines.Add(DatabaseType.CosmosDB_NoSQL, CreateCosmosMutationEngine());
+            }
+        }
+
+        /// <summary>The SQL database types that share the single SQL mutation engine instance.</summary>
+        private static readonly DatabaseType[] SqlDatabaseTypes =
+        {
+            DatabaseType.MySQL,
+            DatabaseType.MSSQL,
+            DatabaseType.PostgreSQL,
+            DatabaseType.DWSQL
+        };
+
+        private IMutationEngine CreateSqlMutationEngine()
+        {
+            return new SqlMutationEngine(
+                _queryManagerFactory,
+                _metadataProviderFactory,
+                _queryEngineFactory,
+                _authorizationResolver,
+                _gQLFilterParser,
+                _httpContextAccessor,
+                _runtimeConfigProvider);
+        }
+
+        private IMutationEngine CreateCosmosMutationEngine()
+        {
+            return new CosmosMutationEngine(_cosmosClientProvider, _metadataProviderFactory, _authorizationResolver);
+        }
+
+        /// <summary>
+        /// Custom fork: rebuilds the mutation engine entries for a single database type from the
+        /// current runtime configuration. SQL database types share one engine instance, so all
+        /// SQL keys are replaced together. Used by the scoped hot reload engine; see
+        /// <c>Azure.DataApiBuilder.Core.Custom.HotReload</c>.
+        /// </summary>
+        internal void RebuildMutationEngine(DatabaseType databaseType)
+        {
+            RuntimeConfig config = _runtimeConfigProvider.GetConfig();
+
+            if (databaseType == DatabaseType.CosmosDB_NoSQL)
+            {
+                _mutationEngines.Remove(DatabaseType.CosmosDB_NoSQL);
+                if (config.CosmosDataSourceUsed)
+                {
+                    _mutationEngines.Add(DatabaseType.CosmosDB_NoSQL, CreateCosmosMutationEngine());
+                }
+
+                return;
+            }
+
+            foreach (DatabaseType sqlDatabaseType in SqlDatabaseTypes)
+            {
+                _mutationEngines.Remove(sqlDatabaseType);
+            }
+
+            if (config.SqlDataSourceUsed)
+            {
+                IMutationEngine mutationEngine = CreateSqlMutationEngine();
+                foreach (DatabaseType sqlDatabaseType in SqlDatabaseTypes)
+                {
+                    _mutationEngines.Add(sqlDatabaseType, mutationEngine);
+                }
             }
         }
 
         public void OnConfigChanged(object? sender, HotReloadEventArgs args)
         {
+            // Custom fork: single-database hot reload. When the engine installed a scoped
+            // change set, rebuild only the changed database types and skip the full rebuild.
+            if (this.TryApplyScopedMutationEngineRebuild(args))
+            {
+                return;
+            }
+
             _mutationEngines = new Dictionary<DatabaseType, IMutationEngine>();
             ConfigureMutationEngines();
         }

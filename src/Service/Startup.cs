@@ -21,6 +21,7 @@ using Azure.DataApiBuilder.Core.AuthenticationHelpers.AuthenticationSimulator;
 using Azure.DataApiBuilder.Core.AuthenticationHelpers.UnauthenticatedAuthentication;
 using Azure.DataApiBuilder.Core.Authorization;
 using Azure.DataApiBuilder.Core.Configurations;
+using Azure.DataApiBuilder.Core.Custom.HotReload;
 using Azure.DataApiBuilder.Core.Models;
 using Azure.DataApiBuilder.Core.Parsers;
 using Azure.DataApiBuilder.Core.Resolvers;
@@ -321,6 +322,11 @@ namespace Azure.DataApiBuilder.Service
             services.AddSingleton<IMutationEngineFactory, MutationEngineFactory>();
 
             services.AddSingleton<IMetadataProviderFactory, MetadataProviderFactory>();
+
+            // Custom fork: single-database configuration and in-memory schema hot reloading.
+            // Registers the dual-trigger signals (dev-mode file watcher adapter + /admin/hot-reload
+            // HTTP trigger) and the HotReloadEngine hosted service.
+            services.AddCustomHotReloadEngine();
 
             services.AddSingleton<GraphQLSchemaCreator>();
             services.AddSingleton<GQLFilterParser>();
@@ -997,7 +1003,11 @@ namespace Azure.DataApiBuilder.Service
             // - {X-MS-CLIENT-PRINCIPAL + Client role header for EasyAuth}
             // When enabled, the middleware will prevent Banana Cake Pop(GraphQL client) from loading
             // without proper authorization headers.
-            app.UseClientRoleHeaderAuthorizationMiddleware();
+            // Custom fork: the admin hot-reload endpoint authenticates via its own API key
+            // (DAB_HOT_RELOAD_API_KEY), so it is exempted from the client-role header requirement.
+            app.UseWhen(
+                context => !context.Request.Path.StartsWithSegments(AdminEndpointHotReloadSignal.ENDPOINT_PATH),
+                appBuilder => appBuilder.UseClientRoleHeaderAuthorizationMiddleware());
 
             // Protect the browser-reachable MCP Streamable HTTP transport against DNS rebinding
             // attacks by validating the Host and Origin headers before the request reaches the
@@ -1048,6 +1058,10 @@ namespace Azure.DataApiBuilder.Service
                         await result.ExecuteResultAsync(controller.ControllerContext);
                     });
                 }
+
+                // Custom fork: admin hot-reload trigger (POST /admin/hot-reload). Mapped before
+                // MapControllers so the literal route wins over RestController's catch-all.
+                endpoints.MapAdminHotReloadEndpoint();
 
                 endpoints.MapControllers();
 
