@@ -21,6 +21,7 @@ using Azure.DataApiBuilder.Core.AuthenticationHelpers.AuthenticationSimulator;
 using Azure.DataApiBuilder.Core.AuthenticationHelpers.UnauthenticatedAuthentication;
 using Azure.DataApiBuilder.Core.Authorization;
 using Azure.DataApiBuilder.Core.Configurations;
+using Azure.DataApiBuilder.Core.Custom;
 using Azure.DataApiBuilder.Core.Custom.HotReload;
 using Azure.DataApiBuilder.Core.Models;
 using Azure.DataApiBuilder.Core.Parsers;
@@ -327,6 +328,10 @@ namespace Azure.DataApiBuilder.Service
             // Registers the dual-trigger signals (dev-mode file watcher adapter + /admin/hot-reload
             // HTTP trigger) and the HotReloadEngine hosted service.
             services.AddCustomHotReloadEngine();
+
+            // Custom fork: tenant-aware dynamic schema (dbo.sys_TenantSchemaFields). The hot reload
+            // engine re-hydrates this registry on every reload signal.
+            services.AddTenantSchemaRegistry();
 
             services.AddSingleton<GraphQLSchemaCreator>();
             services.AddSingleton<GQLFilterParser>();
@@ -1457,6 +1462,12 @@ namespace Azure.DataApiBuilder.Service
 
                 IMetadataProviderFactory sqlMetadataProviderFactory =
                     app.ApplicationServices.GetRequiredService<IMetadataProviderFactory>();
+
+                // Custom fork: publish the tenant schema registry before schema inference so each
+                // tenant's JSON attributes are injected as virtual columns while entity metadata is
+                // built. See Azure.DataApiBuilder.Core.Custom.TenantSchemaServiceCollectionExtensions.
+                app.ApplicationServices.UseTenantSchemaRegistry();
+
                 await sqlMetadataProviderFactory.InitializeAsync();
 
                 // Manually trigger DI service instantiation of GraphQLSchemaCreator and RestService

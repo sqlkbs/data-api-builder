@@ -34,6 +34,15 @@ namespace Azure.DataApiBuilder.Core.Resolvers
         /// <inheritdoc />
         public string Build(SqlQueryStructure structure)
         {
+            // Custom tenant dynamic schema: publish this structure's source definition so the
+            // Build(Column) override can recognize JSON attribute columns. Nested OUTER APPLY
+            // subqueries push their own frame. See Azure.DataApiBuilder.Core.Custom.TenantVirtualColumnScope.
+            using TenantVirtualColumnScope.Scope tenantScope = TenantVirtualColumnScope.Push(
+                structure.GetUnderlyingSourceDefinition(),
+                structure.DatabaseObject.SchemaName,
+                structure.DatabaseObject.Name,
+                structure.SourceAlias);
+
             string dataIdent = QuoteIdentifier(SqlQueryStructure.DATA_IDENT);
             string fromSql = $"{QuoteIdentifier(structure.DatabaseObject.SchemaName)}.{QuoteIdentifier(structure.DatabaseObject.Name)} " +
                              $"AS {QuoteIdentifier($"{structure.SourceAlias}")}{Build(structure.Joins)}";
@@ -76,6 +85,12 @@ namespace Azure.DataApiBuilder.Core.Resolvers
         public string Build(SqlInsertStructure structure)
         {
             SourceDefinition sourceDefinition = structure.GetUnderlyingSourceDefinition();
+
+            // Custom tenant dynamic schema: mutation structures reference the qualified table rather
+            // than an alias. See Azure.DataApiBuilder.Core.Custom.TenantVirtualColumnScope.
+            using TenantVirtualColumnScope.Scope tenantScope = TenantVirtualColumnScope.Push(
+                sourceDefinition, structure.DatabaseObject.SchemaName, structure.DatabaseObject.Name, sourceAlias: null);
+
             bool isInsertDMLTriggerEnabled = sourceDefinition.IsInsertDMLTriggerEnabled;
             string tableName = $"{QuoteIdentifier(structure.DatabaseObject.SchemaName)}.{QuoteIdentifier(structure.DatabaseObject.Name)}";
 
@@ -83,11 +98,15 @@ namespace Azure.DataApiBuilder.Core.Resolvers
             string dbPolicypredicates = JoinPredicateStrings(structure.GetDbPolicyForOperation(EntityActionOperation.Create));
 
             // Columns whose values are provided in the request body - to be inserted into the record.
-            string insertColumns = Build(structure.InsertColumns);
+            // Custom tenant dynamic schema: JSON attribute columns are folded into a single
+            // JSON_MODIFY value assigned to their container column, so N API fields become one SQL
+            // column. See Azure.DataApiBuilder.Core.Custom.MsSqlTenantSchemaExtensions.
+            (string insertColumns, string insertValues) = MsSqlTenantSchemaExtensions.CollapseInsertColumnsAndValues(
+                structure.InsertColumns, structure.Values, sourceDefinition, structure.Parameters);
 
             // Values to be inserted into the entity.
             string values = dbPolicypredicates.Equals(BASE_PREDICATE) ?
-                $"VALUES ({string.Join(", ", structure.Values)});" : $"SELECT {insertColumns} FROM (VALUES({string.Join(", ", structure.Values)})) T({insertColumns}) WHERE {dbPolicypredicates};";
+                $"VALUES ({insertValues});" : $"SELECT {insertColumns} FROM (VALUES({insertValues})) T({insertColumns}) WHERE {dbPolicypredicates};";
 
             // Final insert query to be executed against the database.
             StringBuilder insertQuery = new();
@@ -96,15 +115,15 @@ namespace Azure.DataApiBuilder.Core.Resolvers
                 if (!string.IsNullOrEmpty(insertColumns))
                 {
                     // When there is no DML trigger enabled on the table for insert operation, we can use OUTPUT clause to return the data.
-                    // Custom spatial support: spatial OUTPUT columns are projected as WKT via STAsText(). See Azure.DataApiBuilder.Core.Custom.MsSqlSpatialExtensions.
+                    // Custom output projection: tenant JSON attributes project via JSON_VALUE and spatial columns as WKT via STAsText(). See Azure.DataApiBuilder.Core.Custom.MsSqlTenantSchemaExtensions.
                     insertQuery.Append($"INSERT INTO {tableName} ({insertColumns}) OUTPUT " +
-                        $"{structure.OutputColumns.FormatSpatialOutputColumns(OutputQualifier.Inserted.ToString(), sourceDefinition)} ");
+                        $"{structure.OutputColumns.FormatOutputColumns(OutputQualifier.Inserted.ToString(), sourceDefinition)} ");
                     insertQuery.Append(values);
                 }
                 else
                 {
                     insertQuery.Append($"INSERT INTO {tableName} OUTPUT " +
-                        $"{structure.OutputColumns.FormatSpatialOutputColumns(OutputQualifier.Inserted.ToString(), sourceDefinition)} DEFAULT VALUES");
+                        $"{structure.OutputColumns.FormatOutputColumns(OutputQualifier.Inserted.ToString(), sourceDefinition)} DEFAULT VALUES");
                 }
             }
             else
@@ -145,7 +164,7 @@ namespace Azure.DataApiBuilder.Core.Resolvers
 
                 // Build the subsequent select query to return the inserted data. By the time the subsequent select executes,
                 // the trigger would have already executed and we get the data as it is present in the table.
-                StringBuilder subsequentSelect = new($"SELECT {structure.OutputColumns.FormatSpatialOutputColumns(tableName, sourceDefinition)} FROM {tableName} ");
+                StringBuilder subsequentSelect = new($"SELECT {structure.OutputColumns.FormatOutputColumns(tableName, sourceDefinition)} FROM {tableName} ");
 
                 if (nonAutoGenPKColumns.Count > 0)
                 {
@@ -213,20 +232,70 @@ namespace Azure.DataApiBuilder.Core.Resolvers
             return (autoGenPKColumn, nonAutoGenPKColumns);
         }
 
+        /// <summary>
+        /// Builds the SET assignment list of an UPDATE/UPSERT.
+        ///
+        /// Custom tenant dynamic schema: assignments targeting JSON attributes are collapsed into a
+        /// single JSON_MODIFY assignment on their container column. This replaces — rather than
+        /// post-processes — the generic predicate build, because the left-hand side of an assignment
+        /// cannot be rewritten into a JSON_VALUE expression.
+        /// See Azure.DataApiBuilder.Core.Custom.MsSqlTenantSchemaExtensions.
+        /// </summary>
+        private string BuildUpdateOperations(
+            List<Predicate> updateOperations,
+            SourceDefinition sourceDefinition,
+            IReadOnlyDictionary<string, DbConnectionParam> parameters)
+        {
+            return MsSqlTenantSchemaExtensions.BuildUpdateOperations(
+                updateOperations,
+                sourceDefinition,
+                parameters,
+                buildPhysicalAssignment: predicate => Build(predicate));
+        }
+
+        /// <summary>
+        /// Builds a column reference.
+        ///
+        /// Custom tenant dynamic schema: a tenant JSON attribute has no physical column, so its
+        /// reference is rewritten into CAST(JSON_VALUE([container], '$.path') AS type) against the
+        /// container column. Overriding this single method covers every place a column is rendered —
+        /// SELECT projections, filter predicates, ORDER BY, GROUP BY and HAVING.
+        /// See Azure.DataApiBuilder.Core.Custom.MsSqlTenantSchemaExtensions.
+        /// </summary>
+        protected override string Build(Column column)
+        {
+            if (TenantVirtualColumnScope.TryResolve(column, out VirtualColumnDefinition? virtualColumn))
+            {
+                // Reuse the base qualification rules (alias / schema+table / table) by rendering the
+                // container column in this column's place.
+                string containerReference = base.Build(
+                    new Column(column.TableSchema, column.TableName, virtualColumn.ContainerColumnName, column.TableAlias));
+
+                return virtualColumn.ToJsonValueExpression(containerReference);
+            }
+
+            return base.Build(column);
+        }
+
         /// <inheritdoc />
         public string Build(SqlUpdateStructure structure)
         {
             SourceDefinition sourceDefinition = structure.GetUnderlyingSourceDefinition();
+
+            // Custom tenant dynamic schema. See Azure.DataApiBuilder.Core.Custom.TenantVirtualColumnScope.
+            using TenantVirtualColumnScope.Scope tenantScope = TenantVirtualColumnScope.Push(
+                sourceDefinition, structure.DatabaseObject.SchemaName, structure.DatabaseObject.Name, sourceAlias: null);
+
             bool isUpdateTriggerEnabled = sourceDefinition.IsUpdateDMLTriggerEnabled;
             string tableName = $"{QuoteIdentifier(structure.DatabaseObject.SchemaName)}.{QuoteIdentifier(structure.DatabaseObject.Name)}";
             string predicates = JoinPredicateStrings(
                                    structure.GetDbPolicyForOperation(EntityActionOperation.Update),
                                    Build(structure.Predicates));
-            // Custom spatial support: spatial columns returned by the mutation are projected as WKT via STAsText(). See Azure.DataApiBuilder.Core.Custom.MsSqlSpatialExtensions.
+            // Custom output projection: tenant JSON attributes project via JSON_VALUE and spatial columns as WKT via STAsText(). See Azure.DataApiBuilder.Core.Custom.MsSqlTenantSchemaExtensions.
             string columnsToBeReturned =
-                structure.OutputColumns.FormatSpatialOutputColumns(isUpdateTriggerEnabled ? string.Empty : OutputQualifier.Inserted.ToString(), sourceDefinition);
+                structure.OutputColumns.FormatOutputColumns(isUpdateTriggerEnabled ? string.Empty : OutputQualifier.Inserted.ToString(), sourceDefinition);
 
-            StringBuilder updateQuery = new($"UPDATE {tableName} SET {Build(structure.UpdateOperations, ", ")} ");
+            StringBuilder updateQuery = new($"UPDATE {tableName} SET {BuildUpdateOperations(structure.UpdateOperations, sourceDefinition, structure.Parameters)} ");
 
             // If a trigger is enabled on the entity, we cannot use OUTPUT clause to return the record.
             // In such a case, we will use a subsequent select query to get the record. By the time the subsequent select executes,
@@ -257,6 +326,14 @@ namespace Azure.DataApiBuilder.Core.Resolvers
         /// <inheritdoc />
         public string Build(SqlDeleteStructure structure)
         {
+            // Custom tenant dynamic schema: a database policy predicate may reference a JSON
+            // attribute. See Azure.DataApiBuilder.Core.Custom.TenantVirtualColumnScope.
+            using TenantVirtualColumnScope.Scope tenantScope = TenantVirtualColumnScope.Push(
+                structure.GetUnderlyingSourceDefinition(),
+                structure.DatabaseObject.SchemaName,
+                structure.DatabaseObject.Name,
+                sourceAlias: null);
+
             string predicates = JoinPredicateStrings(
                        structure.GetDbPolicyForOperation(EntityActionOperation.Delete),
                        Build(structure.Predicates));
@@ -276,6 +353,11 @@ namespace Azure.DataApiBuilder.Core.Resolvers
         public string Build(SqlUpsertQueryStructure structure)
         {
             SourceDefinition sourceDefinition = structure.GetUnderlyingSourceDefinition();
+
+            // Custom tenant dynamic schema. See Azure.DataApiBuilder.Core.Custom.TenantVirtualColumnScope.
+            using TenantVirtualColumnScope.Scope tenantScope = TenantVirtualColumnScope.Push(
+                sourceDefinition, structure.DatabaseObject.SchemaName, structure.DatabaseObject.Name, sourceAlias: null);
+
             bool isUpdateTriggerEnabled = sourceDefinition.IsUpdateDMLTriggerEnabled;
             string tableName = $"{QuoteIdentifier(structure.DatabaseObject.SchemaName)}.{QuoteIdentifier(structure.DatabaseObject.Name)}";
 
@@ -285,10 +367,10 @@ namespace Azure.DataApiBuilder.Core.Resolvers
             // Predicates by virtue of PK + database policy.
             string updatePredicates = JoinPredicateStrings(pkPredicates, structure.GetDbPolicyForOperation(EntityActionOperation.Update));
 
-            string updateOperations = Build(structure.UpdateOperations, ", ");
-            // Custom spatial support: spatial columns returned by the mutation are projected as WKT via STAsText(). See Azure.DataApiBuilder.Core.Custom.MsSqlSpatialExtensions.
+            string updateOperations = BuildUpdateOperations(structure.UpdateOperations, sourceDefinition, structure.Parameters);
+            // Custom output projection: tenant JSON attributes project via JSON_VALUE and spatial columns as WKT via STAsText(). See Azure.DataApiBuilder.Core.Custom.MsSqlTenantSchemaExtensions.
             string columnsToBeReturned =
-                structure.OutputColumns.FormatSpatialOutputColumns(isUpdateTriggerEnabled ? string.Empty : OutputQualifier.Inserted.ToString(), sourceDefinition);
+                structure.OutputColumns.FormatOutputColumns(isUpdateTriggerEnabled ? string.Empty : OutputQualifier.Inserted.ToString(), sourceDefinition);
             string queryToGetCountOfRecordWithPK = $"SELECT COUNT(*) as {COUNT_ROWS_WITH_GIVEN_PK} FROM {tableName} WHERE {pkPredicates}";
 
             // Query to get the number of records with a given PK.
@@ -348,7 +430,7 @@ namespace Azure.DataApiBuilder.Core.Resolvers
                     {
                         // This is just an optimisation. If update trigger is enabled, then this build method had created
                         // columnsToBeReturned without the Inserted prefix.
-                        columnsToBeReturned = structure.OutputColumns.FormatSpatialOutputColumns(OutputQualifier.Inserted.ToString(), sourceDefinition);
+                        columnsToBeReturned = structure.OutputColumns.FormatOutputColumns(OutputQualifier.Inserted.ToString(), sourceDefinition);
                     }
 
                     insertQuery.Append($"OUTPUT {columnsToBeReturned}");
@@ -359,7 +441,7 @@ namespace Azure.DataApiBuilder.Core.Resolvers
                 {
                     // This is again just an optimisation. If update trigger was enabled, then the columnsToBeReturned would
                     // have already been created without any prefix.
-                    columnsToBeReturned = structure.OutputColumns.FormatSpatialOutputColumns(string.Empty, sourceDefinition);
+                    columnsToBeReturned = structure.OutputColumns.FormatOutputColumns(string.Empty, sourceDefinition);
                 }
 
                 // Query to fetch the column values to be inserted into the entity.

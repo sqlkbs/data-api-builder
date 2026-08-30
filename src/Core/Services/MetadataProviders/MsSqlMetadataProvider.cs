@@ -33,6 +33,14 @@ namespace Azure.DataApiBuilder.Core.Services
     {
         private RuntimeConfigProvider _runtimeConfigProvider;
 
+        /// <summary>
+        /// Custom tenant dynamic schema: entity whose table metadata is currently being populated,
+        /// captured while trigger metadata is read and consumed once the physical columns are known.
+        /// A single slot is safe because SqlMetadataProvider populates entities sequentially.
+        /// See Azure.DataApiBuilder.Core.Custom.MsSqlTenantSchemaExtensions.
+        /// </summary>
+        private TenantVirtualColumnTarget? _tenantVirtualColumnTarget;
+
         public MsSqlMetadataProvider(
             RuntimeConfigProvider runtimeConfigProvider,
             RuntimeConfigValidator runtimeConfigValidator,
@@ -65,6 +73,11 @@ namespace Azure.DataApiBuilder.Core.Services
         /// <inheritdoc/>
         public override async Task PopulateTriggerMetadataForTable(string entityName, string schemaName, string tableName, SourceDefinition sourceDefinition)
         {
+            // Custom tenant dynamic schema: hydrate the registry and capture this entity so its JSON
+            // attributes can be injected as virtual columns once the physical columns are known.
+            // See Azure.DataApiBuilder.Core.Custom.MsSqlTenantSchemaExtensions.
+            _tenantVirtualColumnTarget = await MsSqlTenantSchemaExtensions.PrepareTenantVirtualColumnsAsync(_runtimeConfigProvider, _dataSourceName, entityName, sourceDefinition);
+
             string enumerateEnabledTriggers = SqlQueryBuilder.BuildFetchEnabledTriggersQuery();
             Dictionary<string, DbConnectionParam> parameters = new()
             {
@@ -157,6 +170,11 @@ namespace Azure.DataApiBuilder.Core.Services
                     }
                 }
             }
+
+            // Custom tenant dynamic schema: now that every physical column is known, inject this
+            // tenant's JSON attributes as virtual columns (a physical column always wins a name
+            // collision). See Azure.DataApiBuilder.Core.Custom.MsSqlTenantSchemaExtensions.
+            _tenantVirtualColumnTarget = _tenantVirtualColumnTarget.InjectTenantVirtualColumns(_runtimeConfigProvider, sourceDefinition, _logger);
         }
 
         /// <inheritdoc/>

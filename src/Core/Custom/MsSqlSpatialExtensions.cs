@@ -148,8 +148,10 @@ public static class MsSqlSpatialExtensions
     /// <summary>
     /// Formats a single mutation output column: spatial columns are projected as
     /// {prefix}.[Column].STAsText() AS [Label] (e.g. Inserted.[shape].STAsText() AS [shape]).
+    /// Exposed to <see cref="MsSqlTenantSchemaExtensions"/> so it can delegate every physical column
+    /// here while formatting tenant JSON attribute columns itself.
     /// </summary>
-    private static string FormatSpatialOutputColumn(LabelledColumn column, string columnPrefix, SourceDefinition sourceDefinition)
+    internal static string FormatSpatialOutputColumn(LabelledColumn column, string columnPrefix, SourceDefinition sourceDefinition)
     {
         string columnReference = string.IsNullOrEmpty(columnPrefix)
             ? QuoteIdentifier(column.ColumnName)

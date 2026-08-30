@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using Azure.DataApiBuilder.Auth;
 using Azure.DataApiBuilder.Config;
 using Azure.DataApiBuilder.Core.Configurations;
+using Azure.DataApiBuilder.Core.Custom;
 using Azure.DataApiBuilder.Core.Custom.HotReload;
 using Azure.DataApiBuilder.Core.Models;
 using Azure.DataApiBuilder.Core.Resolvers;
@@ -71,15 +72,55 @@ public class HotReloadEngineUnitTests
         return path;
     }
 
+    /// <summary>
+    /// Stand-in for the tenant schema registry. <see cref="SnapshotVersion"/> advances only when
+    /// <see cref="ReportsSchemaChange"/> is set, letting a test assert that an unchanged dynamic
+    /// schema does not trigger extra rebuilds.
+    /// </summary>
     private sealed class FakeTenantRegistry : ITenantSchemaRegistryService
     {
         public int ReloadCount { get; private set; }
 
-        public Task ReloadRegistryAsync()
+        /// <summary>When true, each reload publishes a new snapshot version.</summary>
+        public bool ReportsSchemaChange { get; set; }
+
+        /// <summary>When true, the reload reports failure as a real registry would on a read error.</summary>
+        public bool FailReload { get; set; }
+
+        /// <summary>When true, the reload throws, which the engine must still absorb.</summary>
+        public bool ThrowOnReload { get; set; }
+
+        public bool IsHydrated { get; private set; }
+
+        public long SnapshotVersion { get; private set; }
+
+        public Task<bool> ReloadRegistryAsync()
         {
             ReloadCount++;
-            return Task.CompletedTask;
+
+            if (ThrowOnReload)
+            {
+                throw new InvalidOperationException("Simulated tenant schema registry failure.");
+            }
+
+            if (FailReload)
+            {
+                return Task.FromResult(false);
+            }
+
+            IsHydrated = true;
+            if (ReportsSchemaChange)
+            {
+                SnapshotVersion++;
+            }
+
+            return Task.FromResult(true);
         }
+
+        public Task EnsureHydratedAsync() => ReloadRegistryAsync();
+
+        public IReadOnlyList<TenantSchemaField> GetFields(string tenantId, string entityName)
+            => Array.Empty<TenantSchemaField>();
     }
 
     /// <summary>Captures warning/error logs so test failures include the engine's own diagnostics.</summary>
@@ -340,5 +381,113 @@ public class HotReloadEngineUnitTests
             provider.GetConfig().ToJson(),
             loader.LastValidRuntimeConfig!.ToJson(),
             "The new configuration must be promoted to last-known-good.");
+    }
+
+    /// <summary>
+    /// A failure reading dbo.sys_TenantSchemaFields must not roll back an otherwise valid
+    /// configuration reload: the registry keeps its own last-known-good snapshot while the new
+    /// configuration is still promoted.
+    /// </summary>
+    [TestMethod]
+    public async Task AdminReload_TenantRegistryReportsFailure_ConfigReloadStillSucceeds()
+    {
+        // Arrange
+        FakeTenantRegistry registry = new() { FailReload = true };
+        CaptureLogger logger = new();
+        string schemaPath = CreateRealSchemaFile();
+        HotReloadEngine engine = BuildEngine(
+            BuildCosmosConfigJson(includeSecondEntity: false, schemaPath),
+            schemaPath,
+            out MockFileSystem fileSystem,
+            out FileSystemRuntimeConfigLoader loader,
+            out RuntimeConfigProvider provider,
+            out _,
+            out _,
+            out _,
+            registry,
+            logger);
+        await engine.StartAsync(CancellationToken.None);
+
+        // Act
+        fileSystem.File.WriteAllText(CONFIG_PATH, BuildCosmosConfigJson(includeSecondEntity: true, schemaPath));
+        await engine.HandleAdminReloadRequestedAsync();
+
+        // Assert
+        Assert.AreEqual(
+            HotReloadResult.Succeeded,
+            engine.LastResult,
+            $"A tenant schema read failure must not fail the configuration reload. Engine log: {string.Join(" | ", logger.Messages)}");
+        Assert.AreEqual(1, registry.ReloadCount, "The reload must still have been attempted.");
+        Assert.IsTrue(provider.GetConfig().Entities.ContainsKey("Moon"), "The new configuration must be live.");
+        Assert.AreEqual(
+            provider.GetConfig().ToJson(),
+            loader.LastValidRuntimeConfig!.ToJson(),
+            "The new configuration must still be promoted to last-known-good.");
+    }
+
+    /// <summary>
+    /// Even a registry implementation that throws — breaking the non-throwing contract — must not be
+    /// able to fail the configuration reload.
+    /// </summary>
+    [TestMethod]
+    public async Task AdminReload_TenantRegistryThrows_ConfigReloadStillSucceeds()
+    {
+        // Arrange
+        FakeTenantRegistry registry = new() { ThrowOnReload = true };
+        CaptureLogger logger = new();
+        string schemaPath = CreateRealSchemaFile();
+        HotReloadEngine engine = BuildEngine(
+            BuildCosmosConfigJson(includeSecondEntity: false, schemaPath),
+            schemaPath,
+            out MockFileSystem fileSystem,
+            out _,
+            out RuntimeConfigProvider provider,
+            out _,
+            out _,
+            out _,
+            registry,
+            logger);
+        await engine.StartAsync(CancellationToken.None);
+
+        // Act
+        fileSystem.File.WriteAllText(CONFIG_PATH, BuildCosmosConfigJson(includeSecondEntity: true, schemaPath));
+        await engine.HandleAdminReloadRequestedAsync();
+
+        // Assert
+        Assert.AreEqual(
+            HotReloadResult.Succeeded,
+            engine.LastResult,
+            $"A throwing registry must be absorbed. Engine log: {string.Join(" | ", logger.Messages)}");
+        Assert.IsTrue(provider.GetConfig().Entities.ContainsKey("Moon"), "The new configuration must be live.");
+    }
+
+    /// <summary>
+    /// The file-watcher path must also absorb a registry failure, since Development-mode reloads run
+    /// after DAB has already applied the configuration.
+    /// </summary>
+    [TestMethod]
+    public async Task FileWatcherSignal_TenantRegistryReportsFailure_ReloadStillSucceeds()
+    {
+        // Arrange
+        FakeTenantRegistry registry = new() { FailReload = true };
+        string schemaPath = CreateRealSchemaFile();
+        HotReloadEngine engine = BuildEngine(
+            BuildCosmosConfigJson(includeSecondEntity: false, schemaPath),
+            schemaPath,
+            out _,
+            out _,
+            out _,
+            out _,
+            out FileWatcherHotReloadSignal fileWatcherSignal,
+            out _,
+            registry);
+        await engine.StartAsync(CancellationToken.None);
+
+        // Act
+        await fileWatcherSignal.TriggerReloadAsync();
+
+        // Assert
+        Assert.AreEqual(HotReloadResult.Succeeded, engine.LastResult, "A registry failure must not fail file-watcher post-processing.");
+        Assert.AreEqual(1, registry.ReloadCount);
     }
 }

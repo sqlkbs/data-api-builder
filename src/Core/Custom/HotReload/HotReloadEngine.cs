@@ -4,6 +4,7 @@
 using Azure.DataApiBuilder.Config;
 using Azure.DataApiBuilder.Config.ObjectModel;
 using Azure.DataApiBuilder.Core.Configurations;
+using Azure.DataApiBuilder.Core.Custom;
 using Azure.DataApiBuilder.Core.Models;
 using Azure.DataApiBuilder.Core.Resolvers.Factories;
 using Azure.DataApiBuilder.Core.Services.MetadataProviders;
@@ -49,8 +50,12 @@ public enum HotReloadResult
 /// <item>Evicts the Hot Chocolate request executor (via DAB's existing
 /// <c>GRAPHQL_SCHEMA_EVICTION_ON_CONFIG_CHANGED</c> wiring) so the schema is lazily
 /// re-stitched from the new configuration on the next GraphQL request.</item>
-/// <item>Invokes <see cref="ITenantSchemaRegistryService.ReloadRegistryAsync"/> when the
-/// (future) tenant schema registry feature is registered.</item>
+/// <item>Invokes <see cref="ITenantSchemaRegistryService.ReloadRegistryAsync"/> when the tenant
+/// schema registry feature is registered, so the dynamic <c>dbo.sys_TenantSchemaFields</c> cache
+/// is re-hydrated alongside DAB's own configuration metadata. When that reload actually changes
+/// the dynamic schema, the change set is widened to include the tenant data sources so entity
+/// metadata, field-level authorization and the GraphQL schema are rebuilt even if
+/// dab-config.json itself did not change.</item>
 /// </list>
 ///
 /// <para>
@@ -58,7 +63,9 @@ public enum HotReloadResult
 /// <see cref="FileSystemRuntimeConfigLoader.TryLoadConfig"/> (which keeps the previous config
 /// active). Any validation, diff, or scoped-rebuild failure is caught here: the LKG config is
 /// restored, the affected data sources are rebuilt from the LKG config, a warning is logged,
-/// and the process keeps serving — never crashing the application.
+/// and the process keeps serving — never crashing the application. A failure to read
+/// <c>dbo.sys_TenantSchemaFields</c> is deliberately NOT fatal: the registry keeps its own
+/// last-known-good snapshot and the configuration reload still succeeds.
 /// </para>
 /// </summary>
 public sealed class HotReloadEngine : IHostedService
@@ -202,21 +209,36 @@ public sealed class HotReloadEngine : IHostedService
     /// pipeline has already re-parsed, validated, and applied the configuration and raised the
     /// factory events (scoped via the change-token callback above). This handler completes the
     /// custom post-reload steps: tenant schema registry re-sync and diff-baseline update.
+    ///
+    /// <para>
+    /// Because DAB's cascade has already run against the pre-reload registry snapshot, a dynamic
+    /// schema change is applied by widening the change set to the tenant data sources and
+    /// re-raising the config-changed events, which rebuilds their entity metadata (picking up the
+    /// new virtual columns), re-expands wildcard field permissions, and evicts the GraphQL schema.
+    /// </para>
     /// </summary>
     private async Task HandleFileWatcherReloadRequestedAsync()
     {
         await _reloadGate.WaitAsync();
         try
         {
-            await ReloadTenantSchemaRegistryAsync();
+            bool tenantSchemaChanged = await ReloadTenantSchemaRegistryAsync();
 
             if (_runtimeConfigProvider.TryGetLoadedConfig(out RuntimeConfig? current))
             {
+                if (tenantSchemaChanged)
+                {
+                    HotReloadScope.Current = WidenDiffForTenantSchema(ConfigDiff.Empty, current);
+                    FireConfigChangedEvents();
+                }
+
                 _lastSeenConfig = current;
             }
 
             LastResult = HotReloadResult.Succeeded;
-            _logger.LogInformation("File-watcher hot reload post-processing completed. Tenant schema registry re-synced.");
+            _logger.LogInformation(
+                "File-watcher hot reload post-processing completed. Tenant schema registry re-synced (dynamic schema changed: {TenantSchemaChanged}).",
+                tenantSchemaChanged);
         }
         catch (Exception ex)
         {
@@ -305,23 +327,37 @@ public sealed class HotReloadEngine : IHostedService
                 _pendingDiff = null;
             }
 
-            if (!newConfig.IsDevelopmentMode())
+            // Step 5: re-sync the dynamic tenant schema registry. Deliberately performed AFTER the
+            // configuration has been swapped in, so a newly added tenant data source is visible to
+            // the registry, and BEFORE the factory events below, so the entity metadata rebuild
+            // observes the new snapshot. Null-tolerant and never fatal.
+            bool tenantSchemaChanged = await ReloadTenantSchemaRegistryAsync();
+
+            // Step 6: widen the change set when the dynamic schema actually changed, so entity
+            // metadata, field-level authorization and the GraphQL schema are refreshed even when
+            // dab-config.json itself is unchanged (in which case the diff is empty and the scoped
+            // rebuild would otherwise touch nothing).
+            if (tenantSchemaChanged)
+            {
+                HotReloadScope.Current = WidenDiffForTenantSchema(diff, newConfig);
+            }
+
+            // In Development mode DAB's cascade already ran inside the signal above, against the
+            // pre-reload registry snapshot; re-raise it so the widened change set is applied.
+            if (!newConfig.IsDevelopmentMode() || tenantSchemaChanged)
             {
                 FireConfigChangedEvents();
             }
 
-            // Step 5: re-sync the dynamic tenant schema registry (null-tolerant; the registry
-            // implementation is delivered by its own feature branch).
-            await ReloadTenantSchemaRegistryAsync();
-
-            // Step 6: promote the new configuration to last-known-good and record the baseline.
+            // Step 7: promote the new configuration to last-known-good and record the baseline.
             _configLoader.SetLkgConfig();
             _lastSeenConfig = newConfig;
             LastResult = HotReloadResult.Succeeded;
 
             _logger.LogInformation(
-                "Admin hot reload succeeded. Changed data sources: {DataSourceNames}.",
-                string.Join(", ", diff.ChangedDataSourceNames));
+                "Admin hot reload succeeded. Changed data sources: {DataSourceNames}. Dynamic tenant schema changed: {TenantSchemaChanged}.",
+                string.Join(", ", diff.ChangedDataSourceNames),
+                tenantSchemaChanged);
         }
         catch (Exception ex)
         {
@@ -424,17 +460,66 @@ public sealed class HotReloadEngine : IHostedService
     }
 
     /// <summary>
-    /// Invokes the tenant schema registry reload when the service is registered. The registry
-    /// feature is delivered by a separate feature branch; until then this is a graceful no-op.
+    /// Invokes the tenant schema registry reload when the service is registered, and reports
+    /// whether the dynamic schema actually changed (detected via
+    /// <see cref="ITenantSchemaRegistryService.SnapshotVersion"/>, which only advances when the
+    /// content of <c>dbo.sys_TenantSchemaFields</c> differs from the published snapshot).
+    ///
+    /// <para>
+    /// Never propagates a failure. <see cref="ITenantSchemaRegistryService.ReloadRegistryAsync"/>
+    /// is contractually non-throwing and keeps its last-known-good snapshot on a database read
+    /// error; the extra guard here ensures that even a misbehaving implementation cannot cause the
+    /// caller to roll back an otherwise valid configuration reload.
+    /// </para>
     /// </summary>
-    private async Task ReloadTenantSchemaRegistryAsync()
+    /// <returns>True when a new dynamic schema snapshot was published, otherwise false.</returns>
+    private async Task<bool> ReloadTenantSchemaRegistryAsync()
     {
         ITenantSchemaRegistryService? registry = _serviceProvider.GetService<ITenantSchemaRegistryService>();
         if (registry is null)
         {
-            return;
+            return false;
         }
 
-        await registry.ReloadRegistryAsync();
+        long versionBeforeReload = registry.SnapshotVersion;
+
+        try
+        {
+            if (!await registry.ReloadRegistryAsync())
+            {
+                _logger.LogWarning(
+                    "The tenant schema registry could not be reloaded; its last-known-good snapshot (version {SnapshotVersion}) remains active. The configuration reload continues.",
+                    registry.SnapshotVersion);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                exception: ex,
+                message: "The tenant schema registry reload threw unexpectedly. Its last-known-good snapshot remains active and the configuration reload continues.");
+            return false;
+        }
+
+        return registry.SnapshotVersion != versionBeforeReload;
+    }
+
+    /// <summary>
+    /// Returns a change set that additionally covers every MS SQL data source declaring a
+    /// <c>tenant-id</c>, so a dynamic schema change rebuilds their entity metadata (re-injecting the
+    /// virtual columns), re-expands wildcard field permissions, and refreshes the derived REST and
+    /// GraphQL schemas — even when the configuration diff is empty.
+    /// </summary>
+    internal static ConfigDiff WidenDiffForTenantSchema(ConfigDiff diff, RuntimeConfig runtimeConfig)
+    {
+        HashSet<string> dataSourceNames = new(diff.ChangedDataSourceNames, StringComparer.OrdinalIgnoreCase);
+        HashSet<DatabaseType> databaseTypes = new(diff.ChangedDatabaseTypes);
+
+        foreach ((string dataSourceName, string _, string _) in runtimeConfig.GetTenantDataSources())
+        {
+            dataSourceNames.Add(dataSourceName);
+            databaseTypes.Add(runtimeConfig.GetDataSourceFromDataSourceName(dataSourceName).DatabaseType);
+        }
+
+        return new ConfigDiff(dataSourceNames, databaseTypes);
     }
 }
