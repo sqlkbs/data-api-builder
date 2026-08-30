@@ -21,6 +21,9 @@ git rebase main
 git checkout feature/mssql-schema-hot-reload
 git rebase main
 
+# Update feature 3
+git checkout feature/tenant-dynamic-schema
+git rebase main
 
 ### Step C: Rebuild the Release Branch
 
@@ -33,6 +36,7 @@ git reset --hard main
 # 2. Merge each updated feature branch in sequence
 git merge feature/mssql-geometry --no-ff -m "Merge MSSQL Geometry support"
 git merge feature/mssql-schema-hot-reload --no-ff -m "Merge MSSQL Schema Hot Reload"
+git merge feature/tenant-dynamic-schema --no-ff -m "Merge MSSQL Tenant Dynamic Schema"
 
 # 3. Push to your private repo to trigger your Azure DevOps / GitHub Actions build
 git push origin release/custom-build --force-with-lease
